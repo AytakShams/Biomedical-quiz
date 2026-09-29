@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Scan to play: Spike or Subthreshold?</title>
+<link rel="stylesheet" href="quiz.css?v=2">
+</head>
+<body>
+<main class="present">
+  <div>
+    <h1>Spike or Subthreshold?</h1>
+    <p class="lede">Scan with your phone camera, type your name, and go. 12 questions, about 5 minutes.</p>
+
+    <div id="qr" role="img" aria-label="QR code linking to the quiz"></div>
+    <div class="url" id="url"></div>
+
+    <p class="joined" id="joined" aria-live="polite"><b>0</b> joined</p>
+
+    <div class="top hidden" id="top">
+      <ol id="topList"></ol>
+    </div>
+
+    <form id="set" class="set">
+      <label for="link">Quiz link blocked on the school network, or using a different domain? Paste the working link here:</label>
+      <div><input id="link" type="url" placeholder="https://…" autocomplete="off"><button type="submit">Update QR</button></div>
+      <div style="margin-top:10px"><button type="button" class="btn ghost" id="toggleTop" style="width:auto;padding:9px 14px;min-height:44px">Show top 10</button></div>
+    </form>
+  </div>
+</main>
+<script src="qrcode.js?v=2"></script>
+<script src="present.js?v=2"></script>
+</body>
+</html>
