@@ -4,32 +4,72 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Scan to play: Spike or Subthreshold?</title>
-<link rel="stylesheet" href="quiz.css?v=2">
+<title>Board — Spike or Subthreshold?</title>
+<link rel="stylesheet" href="quiz.css?v=3">
 </head>
 <body>
-<main class="present">
-  <div>
-    <h1>Spike or Subthreshold?</h1>
-    <p class="lede">Scan with your phone camera, type your name, and go. 12 questions, about 5 minutes.</p>
 
-    <div id="qr" role="img" aria-label="QR code linking to the quiz"></div>
-    <div class="url" id="url"></div>
-
-    <p class="joined" id="joined" aria-live="polite"><b>0</b> joined</p>
-
-    <div class="top hidden" id="top">
-      <ol id="topList"></ol>
-    </div>
-
-    <form id="set" class="set">
-      <label for="link">Quiz link blocked on the school network, or using a different domain? Paste the working link here:</label>
-      <div><input id="link" type="url" placeholder="https://…" autocomplete="off"><button type="submit">Update QR</button></div>
-      <div style="margin-top:10px"><button type="button" class="btn ghost" id="toggleTop" style="width:auto;padding:9px 14px;min-height:44px">Show top 10</button></div>
-    </form>
-  </div>
+<!-- login: the board drives the exam, so it needs the same password as the panel ---- -->
+<main class="wrap" id="login" style="max-width:420px">
+  <h1>Exam board</h1>
+  <p>Lecturer access only. Sign in before class, then project this page.</p>
+  <form id="loginForm" autocomplete="off">
+    <label for="pw">Admin password</label>
+    <input id="pw" type="password" autocomplete="current-password" enterkeyhint="go" required>
+    <p class="err" id="loginErr" aria-live="polite"></p>
+    <button class="btn" type="submit">Open the board</button>
+  </form>
 </main>
-<script src="qrcode.js?v=2"></script>
-<script src="present.js?v=2"></script>
+
+<!-- 1. lobby: students scan and join ---------------------------------------------- -->
+<main class="board hidden" id="lobby">
+  <h1>Spike or Subthreshold?</h1>
+  <p class="lede">Scan the code, type your name, then look up here. 12 questions, 15 seconds each.</p>
+
+  <div class="lobbygrid">
+    <div>
+      <div id="qr" role="img" aria-label="QR code linking to the quiz"></div>
+      <div class="url" id="url"></div>
+    </div>
+    <div class="lobbyside">
+      <p class="joined"><b id="joined">0</b> joined</p>
+      <div class="namecloud" id="names" aria-live="polite"></div>
+      <button class="btn" id="start">Start the exam</button>
+      <p class="note" id="startNote">One attempt each. Everyone answers the same question at the same time.</p>
+    </div>
+  </div>
+
+  <form id="set" class="set">
+    <label for="link">Quiz link blocked on the school network, or using a different domain? Paste the working link here:</label>
+    <div><input id="link" type="url" placeholder="https://…" autocomplete="off"><button type="submit">Update QR</button></div>
+  </form>
+</main>
+
+<!-- 2. the live question, and then its reveal ------------------------------------- -->
+<main class="board hidden" id="ask">
+  <div class="qtop">
+    <span id="qno">Question 1 / 12</span>
+    <span id="counter">0 / 0 answered</span>
+    <span class="secs" id="secs">15</span>
+  </div>
+  <div class="clock"><i id="clockbar"></i></div>
+
+  <h2 id="qtext"></h2>
+  <div class="boardopts" id="boardopts"></div>
+
+  <div class="why hidden" id="why"></div>
+  <button class="btn hidden" id="next">Next question</button>
+</main>
+
+<!-- 3. the podium ----------------------------------------------------------------- -->
+<main class="board hidden" id="done">
+  <h1 id="doneTitle">Top of the class</h1>
+  <div class="podium" id="podium"></div>
+  <ol class="leaders" id="leaders"></ol>
+  <p class="note" id="doneNote"></p>
+</main>
+
+<script src="qrcode.js?v=3"></script>
+<script type="module" src="present.js?v=3"></script>
 </body>
 </html>

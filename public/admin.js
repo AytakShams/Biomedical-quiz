@@ -1,5 +1,7 @@
-// Lecturer's live panel. Polls every 3s -- no WebSockets, because school proxies
+// Lecturer's results panel. Polls every 3s -- no WebSockets, because school proxies
 // break them. The password lives in sessionStorage only, so closing the tab logs out.
+//
+// This page reports; present.html is what drives the exam.
 
 import { QUESTIONS } from "./questions.js";
 
@@ -9,7 +11,7 @@ const QTEXT = new Map(QUESTIONS.map(q => [q.id, q.q]));
 
 let pw = sessionStorage.getItem(PKEY) || "";
 let sessionId = null;          // null = whichever session is currently open
-let sort = { key: "best", dir: -1 };
+let sort = { key: "points", dir: -1 };
 let data = null;
 let poller = null;
 
@@ -66,12 +68,21 @@ async function tick() {
   try {
     data = await getJSON("/api/admin/live" + (sessionId ? "?session=" + sessionId : ""));
     paint();
-    $("#tick").textContent = "updated " + new Date().toLocaleTimeString();
+    $("#tick").textContent = `updated ${new Date().toLocaleTimeString()} · ${phaseLabel()}`;
   } catch (err) {
     if (err.message === "401") return logout("Session expired. Sign in again.");
     $("#tick").textContent = "connection lost — retrying";
   }
 }
+
+// Where the class is right now, so the panel and the board never disagree.
+function phaseLabel() {
+  const p = data?.session?.phase;
+  if (p === "question" || p === "reveal") return `question ${findLive()} of ${data.total}`;
+  if (p === "done") return "finished";
+  return "waiting in the lobby";
+}
+const findLive = () => Math.max(1, data.students.reduce((m, s) => Math.max(m, s.answered), 0));
 
 /* ------------------------------------------------------------------ paint --- */
 const esc = s => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML };
@@ -82,6 +93,7 @@ const ago = ts => {
   if (s < 3600) return Math.round(s / 60) + "m ago";
   return Math.round(s / 3600) + "h ago";
 };
+const num = n => Number(n || 0).toLocaleString("en-US");
 
 function paint() {
   const { session, sessions, students, questions, total } = data;
@@ -99,12 +111,11 @@ function paint() {
 
   // cards
   const visible = students.filter(s => !s.hidden);
-  const finished = visible.filter(s => s.completed).length;   // finished at least once
   const avg = visible.length
-    ? (visible.reduce((a, s) => a + s.best, 0) / visible.length).toFixed(1) : null;
+    ? Math.round(visible.reduce((a, s) => a + s.points, 0) / visible.length) : null;
   $("#cJoined").textContent = visible.length;
-  $("#cFinished").textContent = finished;
-  $("#cAvg").textContent = avg ? `${avg}/${total}` : "–";
+  $("#cFinished").textContent = visible.filter(s => s.finished).length;
+  $("#cAvg").textContent = avg === null ? "–" : num(avg);
   const asked = questions.reduce((a, q) => a + q.asked, 0);
   const right = questions.reduce((a, q) => a + q.correct, 0);
   $("#cAcc").textContent = asked ? Math.round(right / asked * 100) + "%" : "–";
@@ -126,9 +137,8 @@ function paint() {
     <tr class="${s.hidden ? "dimmed" : ""}">
       <td class="rank">${n + 1}</td>
       <td class="name">${esc(s.name)}</td>
-      <td class="num"><b>${s.best}</b>/${total}</td>
-      <td class="num">${s.last}/${total}</td>
-      <td class="num">${s.attempts}</td>
+      <td class="num"><b>${num(s.points)}</b></td>
+      <td class="num">${s.correct}/${total}</td>
       <td class="num">${s.answered}/${total}</td>
       <td>${ago(s.seen)}</td>
       <td>${s.finished

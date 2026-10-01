@@ -146,6 +146,30 @@ export const QUESTIONS = [
   }
 ];
 
-// Map of id -> correct answer text. server.js grades against this; the browser uses it
-// for instant feedback. Built once from QUESTIONS so the two can never drift apart.
-export const ANSWER_KEY = new Map(QUESTIONS.map(q => [q.id, q.correct]));
+// Stable option order. The board, every phone and the grader must agree on which letter
+// is which option, and that order has to survive a server restart in the middle of a
+// lecture -- so it is derived from the question id, never drawn at random. It also means
+// the correct answer is not option A everywhere just because it is written first above.
+const seed = s => {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0;
+  return h;
+};
+
+export function optionsFor(question) {
+  const options = [question.correct, ...question.wrong];
+  let h = seed(question.id);
+  for (let k = options.length - 1; k > 0; k--) {
+    h = (Math.imul(h, 1103515245) + 12345) >>> 0;
+    const j = h % (k + 1);
+    [options[k], options[j]] = [options[j], options[k]];
+  }
+  return { options, correct: options.indexOf(question.correct) };
+}
+
+export const LETTERS = ["A", "B", "C", "D"];
+
+// id -> { options, correct }. server.js grades a submitted index against `correct` and
+// sends `options` out; the board renders both. Built once from QUESTIONS, so the key and
+// the question bank can never drift apart.
+export const KEY = new Map(QUESTIONS.map(q => [q.id, optionsFor(q)]));

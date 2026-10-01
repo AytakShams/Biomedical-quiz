@@ -1,12 +1,18 @@
 // Bioelectricity quiz server: static files + JSON API + SQLite. Zero npm dependencies.
 //
-// Grading lives here, not in the browser. The client sends the option TEXT it tapped;
-// this file compares it against ANSWER_KEY from public/questions.js -- the same file the
-// browser imported -- so a student can read the key but cannot forge a score.
+// One synchronized exam, driven from the lecturer's board. The single source of truth for
+// "where is the class right now" is the open session's row -- phase + q_index +
+// q_started_at. Boards and phones only ever READ that and follow it; nobody advances on
+// their own.
+//
+// Grading AND the clock live here, not in the browser. A phone sends the option INDEX it
+// tapped; this file maps it through KEY from public/questions.js and measures elapsed time
+// against q_started_at, so neither a tampered page nor a badly-set phone clock can buy
+// points. The option texts go out to phones, but never which one is correct.
 //
 // Writes are idempotent: answers has PRIMARY KEY (attempt_id, q_id) and inserts use
-// ON CONFLICT DO NOTHING, so the client's retry queue can replay a batch safely.
-// Scores are always recomputed with SUM(is_correct), never incremented.
+// ON CONFLICT DO NOTHING, so a double tap or a retried request cannot score twice.
+// Totals are always recomputed with SUM(), never incremented.
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -14,7 +20,7 @@ import { join, resolve, extname, sep, dirname } from "node:path";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
-import { QUESTIONS, ANSWER_KEY, QUIZ } from "./public/questions.js";
+import { QUESTIONS, KEY, QUIZ } from "./public/questions.js";
 
 let DatabaseSync;
 try {
@@ -32,7 +38,15 @@ const TOTAL    = QUESTIONS.length;
 const MAX_BODY = 64 * 1024;
 const MAX_STUDENTS_PER_SESSION = 500;   // soft guard; a real class is ~80
 
-if (!ADMIN_PW) console.warn("! ADMIN_PASSWORD is not set - the results panel will refuse every login.");
+// The window every student gets, per question. Overridable so the load test can run a
+// twelve-question exam in seconds -- and so the lecturer can retune the pace without a
+// code change. The board and every phone read it from the server, never hard-code it.
+const QUESTION_MS = Math.max(1000, Number(process.env.QUESTION_MS || 15000));
+const GRACE_MS    = 1200;    // an answer already in flight when the clock hit 0 still counts
+const BASE_POINTS = 1000;    // knowing the answer is worth this much whenever it lands
+const SPEED_POINTS = 200;    // ...plus at most this much for being early
+
+if (!ADMIN_PW) console.warn("! ADMIN_PASSWORD is not set - the board and results panel will refuse every login.");
 
 /* ============================================================== database === */
 const db = new DatabaseSync(DB_PATH);
@@ -43,10 +57,13 @@ db.exec(`
   PRAGMA foreign_keys = ON;
 
   CREATE TABLE IF NOT EXISTS sessions (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    label      TEXT    NOT NULL,
-    is_open    INTEGER NOT NULL DEFAULT 1,
-    created_at INTEGER NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    label        TEXT    NOT NULL,
+    is_open      INTEGER NOT NULL DEFAULT 1,
+    created_at   INTEGER NOT NULL,
+    phase        TEXT    NOT NULL DEFAULT 'lobby',   -- lobby | question | reveal | done
+    q_index      INTEGER NOT NULL DEFAULT -1,
+    q_started_at INTEGER
   );
 
   CREATE TABLE IF NOT EXISTS students (
@@ -66,16 +83,19 @@ db.exec(`
     started_at  INTEGER NOT NULL,
     finished_at INTEGER,
     answered    INTEGER NOT NULL DEFAULT 0,
-    score       INTEGER NOT NULL DEFAULT 0,
+    score       INTEGER NOT NULL DEFAULT 0,   -- questions answered correctly
+    points      INTEGER NOT NULL DEFAULT 0,   -- what the leaderboard ranks on
+    total_ms    INTEGER NOT NULL DEFAULT 0,   -- tiebreaker: the faster class total wins
     total       INTEGER NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS answers (
     attempt_id INTEGER NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
     q_id       TEXT    NOT NULL,
-    choice     TEXT    NOT NULL,
+    choice     TEXT    NOT NULL,              -- the option INDEX, "0".."3"
     is_correct INTEGER NOT NULL,
-    ms         INTEGER,
+    points     INTEGER NOT NULL DEFAULT 0,
+    ms         INTEGER,                       -- server-measured, from q_started_at
     at         INTEGER NOT NULL,
     PRIMARY KEY (attempt_id, q_id)
   );
@@ -83,6 +103,24 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_attempts_student ON attempts(student_id);
   CREATE INDEX IF NOT EXISTS idx_students_session ON students(session_id);
 `);
+
+// The deployed database predates the synchronized exam, so add what is missing in place.
+// ALTER TABLE ... ADD COLUMN is cheap and idempotent; running it on every boot keeps dev,
+// Docker and production on one path with no migration files to track. Rows from the old
+// practice quiz simply keep phase='lobby' and points=0 -- harmless history.
+function addColumns(table, columns) {
+  const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name));
+  for (const [name, def] of Object.entries(columns)) {
+    if (have.has(name)) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${def}`);
+    console.log(`  migrated: ${table}.${name} added`);
+  }
+}
+addColumns("sessions", {
+  phase: "TEXT NOT NULL DEFAULT 'lobby'", q_index: "INTEGER NOT NULL DEFAULT -1", q_started_at: "INTEGER"
+});
+addColumns("attempts", { points: "INTEGER NOT NULL DEFAULT 0", total_ms: "INTEGER NOT NULL DEFAULT 0" });
+addColumns("answers",  { points: "INTEGER NOT NULL DEFAULT 0" });
 
 const q = {
   openSession:    db.prepare("SELECT * FROM sessions WHERE is_open=1 ORDER BY id DESC LIMIT 1"),
@@ -92,42 +130,69 @@ const q = {
   addSession:     db.prepare("INSERT INTO sessions (label,is_open,created_at) VALUES (?,1,?)"),
   closeAll:       db.prepare("UPDATE sessions SET is_open=0"),
   setOpen:        db.prepare("UPDATE sessions SET is_open=? WHERE id=?"),
-  sessionList:    db.prepare(`SELECT s.id, s.label, s.is_open,
+  setPhase:       db.prepare("UPDATE sessions SET phase=?, q_index=?, q_started_at=? WHERE id=?"),
+  sessionList:    db.prepare(`SELECT s.id, s.label, s.is_open, s.phase,
                                      (SELECT COUNT(*) FROM students WHERE session_id=s.id AND hidden=0) AS students
                                 FROM sessions s ORDER BY s.id DESC`),
+  sessionOfToken: db.prepare(`SELECT sess.* FROM sessions sess
+                                JOIN students st ON st.session_id = sess.id
+                                JOIN attempts a  ON a.student_id  = st.id
+                               WHERE a.token=?`),
 
   addStudent:     db.prepare("INSERT OR IGNORE INTO students (session_id,name,name_key,first_seen) VALUES (?,?,?,?)"),
   touchName:      db.prepare("UPDATE students SET name=? WHERE session_id=? AND name_key=?"),
   findStudent:    db.prepare("SELECT * FROM students WHERE session_id=? AND name_key=?"),
   countStudents:  db.prepare("SELECT COUNT(*) AS c FROM students WHERE session_id=?"),
   setHidden:      db.prepare("UPDATE students SET hidden=? WHERE id=?"),
+  names:          db.prepare("SELECT name FROM students WHERE session_id=? AND hidden=0 ORDER BY id DESC"),
+  countJoined:    db.prepare("SELECT COUNT(*) AS c FROM students WHERE session_id=? AND hidden=0"),
 
   addAttempt:     db.prepare("INSERT INTO attempts (student_id,token,started_at,total) VALUES (?,?,?,?)"),
   attemptByToken: db.prepare("SELECT * FROM attempts WHERE token=?"),
-  addAnswer:      db.prepare(`INSERT INTO answers (attempt_id,q_id,choice,is_correct,ms,at)
-                              VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING`),
+  attemptById:    db.prepare("SELECT * FROM attempts WHERE id=?"),
+  // One attempt per student, so the oldest row IS the attempt. Ordering by id keeps that
+  // true even for a student who predates the one-attempt rule.
+  attemptOf:      db.prepare("SELECT * FROM attempts WHERE student_id=? ORDER BY id LIMIT 1"),
+  finishAll:      db.prepare(`UPDATE attempts SET finished_at=?
+                               WHERE finished_at IS NULL
+                                 AND student_id IN (SELECT id FROM students WHERE session_id=?)`),
+
+  addAnswer:      db.prepare(`INSERT INTO answers (attempt_id,q_id,choice,is_correct,points,ms,at)
+                              VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`),
+  answerRow:      db.prepare("SELECT choice, is_correct, points FROM answers WHERE attempt_id=? AND q_id=?"),
   rescore:        db.prepare(`UPDATE attempts SET
                                 score    = (SELECT COALESCE(SUM(is_correct),0) FROM answers WHERE attempt_id=?),
-                                answered = (SELECT COUNT(*)                    FROM answers WHERE attempt_id=?)
+                                points   = (SELECT COALESCE(SUM(points),0)     FROM answers WHERE attempt_id=?),
+                                answered = (SELECT COUNT(*)                    FROM answers WHERE attempt_id=?),
+                                total_ms = (SELECT COALESCE(SUM(ms),0)         FROM answers WHERE attempt_id=?)
                               WHERE id=?`),
-  finish:         db.prepare("UPDATE attempts SET finished_at=? WHERE id=? AND finished_at IS NULL"),
-  attemptById:    db.prepare("SELECT * FROM attempts WHERE id=?"),
+
+  countAnswered:  db.prepare(`SELECT COUNT(*) AS c FROM answers an
+                                JOIN attempts a ON a.id = an.attempt_id
+                                JOIN students s ON s.id = a.student_id
+                               WHERE s.session_id=? AND s.hidden=0 AND an.q_id=?`),
+  dist:           db.prepare(`SELECT an.choice AS c, COUNT(*) AS n FROM answers an
+                                JOIN attempts a ON a.id = an.attempt_id
+                                JOIN students s ON s.id = a.student_id
+                               WHERE s.session_id=? AND s.hidden=0 AND an.q_id=?
+                               GROUP BY an.choice`),
+
+  // The leaderboard: points first, then the faster total time, then name so the order is
+  // never arbitrary. Hidden students are out of the ranking entirely.
+  leaderboard:    db.prepare(`SELECT s.id, s.name, a.points, a.score, a.total_ms
+                                FROM students s JOIN attempts a ON a.student_id = s.id
+                               WHERE s.session_id=? AND s.hidden=0
+                               ORDER BY a.points DESC, a.total_ms ASC, s.name`),
 
   roster: db.prepare(`
     SELECT s.id, s.name, s.hidden, s.first_seen,
-           (SELECT COUNT(*)              FROM attempts WHERE student_id=s.id)                        AS attempts,
-           (SELECT COALESCE(MAX(score),0) FROM attempts WHERE student_id=s.id)                       AS best,
-           (SELECT COALESCE(score,0)     FROM attempts WHERE student_id=s.id ORDER BY id DESC LIMIT 1) AS last,
-           (SELECT COALESCE(answered,0)  FROM attempts WHERE student_id=s.id ORDER BY id DESC LIMIT 1) AS answered,
-           (SELECT COUNT(*)              FROM attempts WHERE student_id=s.id AND finished_at IS NOT NULL) AS dones,
-           (SELECT finished_at           FROM attempts WHERE student_id=s.id ORDER BY id DESC LIMIT 1)    AS last_finished,
-           (SELECT MAX(v) FROM (
-              SELECT MAX(started_at) AS v FROM attempts WHERE student_id=s.id
-              UNION ALL
-              SELECT MAX(an.at)      AS v FROM answers an
-                JOIN attempts a2 ON a2.id=an.attempt_id WHERE a2.student_id=s.id
-           ))                                                                                        AS seen
-      FROM students s WHERE s.session_id=? ORDER BY s.id`),
+           COALESCE(a.points,0)   AS points,
+           COALESCE(a.score,0)    AS score,
+           COALESCE(a.answered,0) AS answered,
+           a.finished_at,
+           COALESCE((SELECT MAX(an.at) FROM answers an WHERE an.attempt_id = a.id), s.first_seen) AS seen
+      FROM students s LEFT JOIN attempts a ON a.student_id = s.id
+     WHERE s.session_id=? ORDER BY s.id`),
 
   qstats: db.prepare(`
     SELECT an.q_id AS id, COUNT(*) AS asked, SUM(an.is_correct) AS correct
@@ -139,6 +204,13 @@ const q = {
 };
 
 const now = () => Date.now();
+
+// Knowledge first, speed only as a tiebreaker: a correct answer is worth BASE_POINTS
+// whenever it lands inside the window, plus up to SPEED_POINTS for being early. A wrong
+// answer and no answer at all are both worth nothing.
+const pointsFor = (correct, elapsed) => correct
+  ? BASE_POINTS + Math.round(SPEED_POINTS * Math.max(0, QUESTION_MS - elapsed) / QUESTION_MS)
+  : 0;
 
 function defaultLabel() {
   const d = new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
@@ -159,6 +231,20 @@ function sessionForJoin() {
   if (q.countSessions.get().c === 0) return createSession(null);
   return null;
 }
+
+// Lazily close the window. The board's countdown is a display, not the clock: any read
+// after the deadline moves the class on by itself. So a backgrounded or closed board tab
+// cannot freeze the exam, two open boards cannot skip a question, and a late answer is
+// refused even if nobody was looking at the projector.
+function advance(session) {
+  if (session && session.phase === "question" && now() - session.q_started_at > QUESTION_MS + GRACE_MS) {
+    q.setPhase.run("reveal", session.q_index, session.q_started_at, session.id);
+    return q.sessionById.get(session.id);
+  }
+  return session;
+}
+const liveSession = () => advance(q.openSession.get() || q.latestSession.get());
+const remaining = s => s.phase === "question" ? Math.max(0, QUESTION_MS - (now() - s.q_started_at)) : 0;
 
 // Turkish-aware folding so "AYŞE YILMAZ" and "Ayşe Yılmaz" are one student.
 const normName = s => String(s ?? "").normalize("NFC").replace(/\s+/g, " ").trim().slice(0, 60);
@@ -248,11 +334,56 @@ function authed(req) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/* ================================================================ board === */
+// Everything the projector needs, in one small payload. Nothing here gives away a live
+// answer: correctIndex appears only once the class has moved on to the reveal.
+function boardState() {
+  const session = liveSession();
+  if (!session) return { phase: "lobby", qIndex: -1, total: TOTAL, joined: 0, names: [], answeredCount: 0 };
+
+  const out = {
+    phase: session.phase,
+    qIndex: session.q_index,
+    total: TOTAL,
+    label: session.label,
+    isOpen: !!session.is_open,
+    remainingMs: remaining(session),
+    questionMs: QUESTION_MS,
+    joined: q.countJoined.get(session.id).c,
+    answeredCount: 0
+  };
+
+  if (session.phase === "lobby") out.names = q.names.all(session.id).slice(0, 40).map(r => r.name);
+
+  if (session.q_index >= 0 && session.q_index < TOTAL) {
+    const id = QUESTIONS[session.q_index].id;
+    out.answeredCount = q.countAnswered.get(session.id, id).c;
+    if (session.phase === "reveal") {
+      out.correctIndex = KEY.get(id).correct;
+      out.dist = [0, 0, 0, 0];
+      for (const r of q.dist.all(session.id, id)) {
+        const c = Number(r.c);
+        if (c >= 0 && c < 4) out.dist[c] = r.n;
+      }
+    }
+  }
+
+  if (session.phase === "done") {
+    const rows = q.leaderboard.all(session.id);
+    const place = r => ({ name: r.name, points: r.points, correct: r.score });
+    // Nobody stands on the podium for scoring zero -- in a small or quiet class that
+    // would put a student who never answered in third place.
+    out.podium  = rows.filter(r => r.points > 0).slice(0, 3).map(place);
+    out.leaders = rows.slice(0, 10).map(place);
+  }
+  return out;
+}
+
 /* =============================================================== routes === */
 async function api(req, res, url) {
   const p = url.pathname;
 
-  /* ---- student: join ---------------------------------------------------- */
+  /* ---- student: join (or resume) ---------------------------------------- */
   if (p === "/api/join" && req.method === "POST") {
     const body = await readBody(req);
     const name = normName(body.name);
@@ -260,6 +391,7 @@ async function api(req, res, url) {
 
     const session = sessionForJoin();
     if (!session) return send(res, 409, { error: "closed" });
+    if (session.phase === "done") return send(res, 409, { error: "finished" });
 
     const key = nameKey(name);
     let student = q.findStudent.get(session.id, key);
@@ -272,65 +404,98 @@ async function api(req, res, url) {
       q.touchName.run(name, session.id, key);   // keep the latest spelling they typed
     }
 
-    const token = randomBytes(16).toString("hex");
-    q.addAttempt.run(student.id, token, now(), TOTAL);
-    return send(res, 200, { token, name, sessionLabel: session.label, total: TOTAL });
-  }
-
-  /* ---- student: batch of answers ---------------------------------------- */
-  if (p === "/api/answers" && req.method === "POST") {
-    const body = await readBody(req);
-    const attempt = q.attemptByToken.get(String(body.token || ""));
-    if (!attempt) return send(res, 404, { error: "unknown attempt" });
-
-    const list = Array.isArray(body.answers) ? body.answers.slice(0, TOTAL * 2) : [];
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      for (const a of list) {
-        const key = ANSWER_KEY.get(String(a.qId));
-        if (key === undefined) continue;                 // unknown question id: ignore
-        const choice = String(a.choice ?? "").slice(0, 400);
-        const ms = Number.isFinite(+a.ms) ? Math.max(0, Math.min(3600000, +a.ms)) : null;
-        // `at` comes from the phone's clock; a badly-set clock must not poison "last seen".
-        const t = now(), raw = +a.at;
-        const at = Number.isFinite(raw) && raw > t - 7 * 86400000 && raw < t + 60000 ? raw : t;
-        q.addAnswer.run(attempt.id, String(a.qId), choice, choice === key ? 1 : 0, ms, at);
-      }
-      q.rescore.run(attempt.id, attempt.id, attempt.id);
-      db.exec("COMMIT");
-    } catch (e) {
-      db.exec("ROLLBACK");
-      throw e;
+    // One go at the exam, per student, per session. A reload, a locked phone or a second
+    // tab resumes the SAME attempt instead of opening a fresh one -- that is what makes
+    // the single-attempt rule hold without locking anyone out of their own answers.
+    let attempt = q.attemptOf.get(student.id);
+    if (!attempt) {
+      q.addAttempt.run(student.id, randomBytes(16).toString("hex"), now(), TOTAL);
+      attempt = q.attemptOf.get(student.id);
     }
-    const fresh = q.attemptById.get(attempt.id);
-    return send(res, 200, { score: fresh.score, answered: fresh.answered });
+    return send(res, 200, { token: attempt.token, name, sessionLabel: session.label, total: TOTAL });
   }
 
-  /* ---- student: finish -------------------------------------------------- */
-  if (p === "/api/finish" && req.method === "POST") {
-    const body = await readBody(req);
-    const attempt = q.attemptByToken.get(String(body.token || ""));
+  /* ---- student: what should my phone show right now? -------------------- */
+  if (p === "/api/state" && req.method === "GET") {
+    const token = url.searchParams.get("token") || "";
+    const attempt = q.attemptByToken.get(token);
     if (!attempt) return send(res, 404, { error: "unknown attempt" });
-    q.rescore.run(attempt.id, attempt.id, attempt.id);
-    q.finish.run(now(), attempt.id);
+    const session = advance(q.sessionOfToken.get(token));
+
     const fresh = q.attemptById.get(attempt.id);
-    return send(res, 200, { score: fresh.score, answered: fresh.answered, total: TOTAL });
+    const out = {
+      phase: session.phase,
+      qIndex: session.q_index,
+      questionNo: session.q_index + 1,
+      total: TOTAL,
+      remainingMs: remaining(session),
+      questionMs: QUESTION_MS,
+      myPoints: fresh.points,
+      myCorrect: fresh.score
+    };
+
+    if (session.q_index >= 0 && session.q_index < TOTAL &&
+       (session.phase === "question" || session.phase === "reveal")) {
+      const question = QUESTIONS[session.q_index];
+      const key = KEY.get(question.id);
+      // The option TEXTS go to the phone so it can show real choices, but never which one
+      // is right: the key stays on the server and the lecturer's board, so the page source
+      // a student can read holds no answers at all.
+      out.options = key.options;
+      const mine = q.answerRow.get(attempt.id, question.id);
+      out.answered = !!mine;
+      out.myChoice = mine ? Number(mine.choice) : null;
+      if (session.phase === "reveal") {
+        out.correctIndex = key.correct;
+        out.wasCorrect = mine ? !!mine.is_correct : false;
+        out.earned = mine ? mine.points : 0;
+      }
+    }
+
+    if (session.phase === "reveal" || session.phase === "done") {
+      const rows = q.leaderboard.all(session.id);
+      const k = rows.findIndex(r => r.id === attempt.student_id);
+      out.myRank = k >= 0 ? k + 1 : null;
+      out.ranked = rows.length;
+    }
+    return send(res, 200, out);
   }
 
-  /* ---- projector board (public, minimal) -------------------------------- */
-  if (p === "/api/board" && req.method === "GET") {
-    const session = q.openSession.get() || q.latestSession.get();
-    if (!session) return send(res, 200, { joined: 0, finished: 0, top: [] });
-    const roster = q.roster.all(session.id).filter(s => !s.hidden);
+  /* ---- student: answer the live question -------------------------------- */
+  if (p === "/api/answer" && req.method === "POST") {
+    const body = await readBody(req);
+    const token = String(body.token || "");
+    const attempt = q.attemptByToken.get(token);
+    if (!attempt) return send(res, 404, { error: "unknown attempt" });
+
+    const session = advance(q.sessionOfToken.get(token));
+    const choice = Number(body.choice);
+    if (!Number.isInteger(choice) || choice < 0 || choice > 3)
+      return send(res, 400, { error: "bad choice" });
+    // The phone must say WHICH question it is answering. Without that, a tap that was in
+    // flight across a phase change would land on the next question.
+    if (session.phase !== "question" || Number(body.qIndex) !== session.q_index)
+      return send(res, 409, { error: "not the live question" });
+
+    const question = QUESTIONS[session.q_index];
+    const elapsed = Math.max(0, now() - session.q_started_at);
+    const correct = choice === KEY.get(question.id).correct;
+
+    q.addAnswer.run(attempt.id, question.id, String(choice),
+                    correct ? 1 : 0, pointsFor(correct, elapsed), elapsed, now());
+    q.rescore.run(attempt.id, attempt.id, attempt.id, attempt.id, attempt.id);
+
+    // ON CONFLICT DO NOTHING means the FIRST answer stands. Read back what is actually
+    // stored, so a double tap is told the truth rather than the score it hoped for.
+    const stored = q.answerRow.get(attempt.id, question.id);
     return send(res, 200, {
-      joined: roster.length,
-      finished: roster.filter(s => s.dones > 0).length,
-      top: roster.filter(s => s.attempts > 0)
-                 .sort((a, b) => b.best - a.best || a.seen - b.seen)
-                 .slice(0, 10)
-                 .map(s => ({ name: s.name, score: s.best, total: TOTAL }))
+      locked: true, qIndex: session.q_index,
+      choice: Number(stored.choice), correct: !!stored.is_correct, points: stored.points
     });
   }
+
+  /* ---- projector board (display only; the controls below need the password) */
+  if (p === "/api/board" && req.method === "GET") return send(res, 200, boardState());
 
   /* ---- admin ------------------------------------------------------------ */
   if (p.startsWith("/api/admin/")) {
@@ -342,20 +507,38 @@ async function api(req, res, url) {
           || q.openSession.get() || q.latestSession.get() || createSession(null);
     };
 
+    /* the two buttons that drive the exam, pressed from the board */
+    if (p === "/api/admin/control" && req.method === "POST") {
+      const b = await readBody(req);
+      const session = liveSession() || createSession(null);
+
+      if (b.action === "start" && session.phase === "lobby") {
+        q.setPhase.run("question", 0, now(), session.id);
+      } else if (b.action === "next" && session.phase === "reveal") {
+        const next = session.q_index + 1;
+        if (next < TOTAL) {
+          q.setPhase.run("question", next, now(), session.id);
+        } else {
+          q.setPhase.run("done", session.q_index, null, session.id);
+          q.finishAll.run(now(), session.id);   // the exam is over for everyone at once
+        }
+      }
+      // Anything else -- a double-click, a second board tab, an action that does not fit
+      // the current phase -- is a no-op that simply reports where the class really is.
+      return send(res, 200, boardState());
+    }
+
     if (p === "/api/admin/live" && req.method === "GET") {
       const session = pick();
       const stats = new Map(q.qstats.all(session.id).map(r => [r.id, r]));
       return send(res, 200, {
-        session:  { id: session.id, label: session.label, is_open: !!session.is_open },
+        session:  { id: session.id, label: session.label, is_open: !!session.is_open, phase: session.phase },
         sessions: q.sessionList.all().map(s => ({ ...s, is_open: !!s.is_open })),
         total: TOTAL,
         students: q.roster.all(session.id).map(s => ({
           id: s.id, name: s.name, hidden: !!s.hidden,
-          attempts: s.attempts, best: s.best, last: s.last, answered: s.answered,
-          // `finished` = state of the LATEST attempt, so a student who hit "Try again"
-          // shows as in-progress again. `completed` = has finished at least once.
-          finished: !!s.last_finished, completed: s.dones > 0,
-          seen: s.seen || s.first_seen
+          points: s.points, correct: s.score, answered: s.answered,
+          finished: !!s.finished_at, seen: s.seen || s.first_seen
         })),
         questions: QUESTIONS.map(qq => {
           const r = stats.get(qq.id) || { asked: 0, correct: 0 };
@@ -386,10 +569,12 @@ async function api(req, res, url) {
       const session = pick();
       const cell = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
       const iso  = t => t ? new Date(t).toISOString() : "";
-      const lines = [["Name", "Best", "Last", "Attempts", "Answered", "Total", "Finished", "First seen", "Last seen", "Hidden"].map(cell).join(",")];
+      const rank = new Map(q.leaderboard.all(session.id).map((r, i) => [r.id, i + 1]));
+      const lines = [["Rank", "Name", "Points", "Correct", "Total", "Answered", "Finished",
+                      "First seen", "Last seen", "Hidden"].map(cell).join(",")];
       for (const s of q.roster.all(session.id)) {
-        lines.push([s.name, s.best, s.last, s.attempts, s.answered, TOTAL,
-                    s.dones > 0 ? "yes" : "no", iso(s.first_seen), iso(s.seen), s.hidden ? "yes" : "no"]
+        lines.push([rank.get(s.id) || "", s.name, s.points, s.score, TOTAL, s.answered,
+                    s.finished_at ? "yes" : "no", iso(s.first_seen), iso(s.seen), s.hidden ? "yes" : "no"]
                    .map(cell).join(","));
       }
       const csv = "﻿" + lines.join("\r\n") + "\r\n";   // BOM so Excel reads UTF-8
@@ -423,7 +608,7 @@ createServer(async (req, res) => {
     else res.end();
   }
 }).listen(PORT, async () => {
-  console.log(`quiz server on :${PORT}  db=${DB_PATH}  questions=${TOTAL}  admin=${ADMIN_PW ? "set" : "NOT SET"}`);
+  console.log(`quiz server on :${PORT}  db=${DB_PATH}  questions=${TOTAL}  ${QUESTION_MS / 1000}s/question  admin=${ADMIN_PW ? "set" : "NOT SET"}`);
   await reportPersistence();
 });
 

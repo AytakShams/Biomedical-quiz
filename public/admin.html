@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>Live results — Bioelectricity Quiz</title>
-<link rel="stylesheet" href="quiz.css?v=2">
+<link rel="stylesheet" href="quiz.css?v=3">
 </head>
 <body>
 
@@ -34,7 +34,7 @@
   <div class="cards">
     <div class="cardbox"><b id="cJoined">0</b><span>Joined</span></div>
     <div class="cardbox"><b id="cFinished">0</b><span>Finished</span></div>
-    <div class="cardbox"><b id="cAvg">–</b><span>Average best</span></div>
+    <div class="cardbox"><b id="cAvg">–</b><span>Average points</span></div>
     <div class="cardbox"><b id="cAcc">–</b><span>Class accuracy</span></div>
   </div>
 
@@ -48,9 +48,8 @@
       <thead><tr>
         <th class="rank">#</th>
         <th data-sort="name">Name</th>
-        <th data-sort="best" class="num">Best</th>
-        <th data-sort="last" class="num">Last</th>
-        <th data-sort="attempts" class="num">Tries</th>
+        <th data-sort="points" class="num">Points</th>
+        <th data-sort="correct" class="num">Correct</th>
         <th data-sort="answered" class="num">Progress</th>
         <th data-sort="seen">Last seen</th>
         <th>Status</th>
@@ -63,11 +62,11 @@
 
   <section class="qstats">
     <h2>Which questions did the class miss?</h2>
-    <p class="note">Share of correct answers across every attempt in this session. Amber marks the questions worth revisiting.</p>
+    <p class="note">Share of correct answers in this session. Amber marks the questions worth revisiting.</p>
     <div id="qrows"></div>
   </section>
 </main>
 
-<script type="module" src="admin.js?v=2"></script>
+<script type="module" src="admin.js?v=3"></script>
 </body>
 </html>

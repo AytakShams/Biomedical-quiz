@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex">
 <title>Spike or Subthreshold? Bioelectricity Quiz</title>
-<link rel="stylesheet" href="quiz.css?v=2">
+<link rel="stylesheet" href="quiz.css?v=3">
 <style>main{max-width:600px;margin:0 auto;padding:20px 18px 64px}</style>
 </head>
 <body>
@@ -14,50 +14,52 @@
 <!-- 1. name entry -------------------------------------------------------- -->
 <section id="join">
   <h1>Spike or Subthreshold?</h1>
-  <p id="blurb">12 questions on membrane and action potentials. Every right answer fires a spike on your trace; every miss dips below rest. About 5 minutes.</p>
-  <div class="strip"><svg viewBox="0 0 360 60" aria-hidden="true"><line class="base" x1="0" y1="40" x2="360" y2="40"/><polyline class="tr" points="0,40 110,40 116,40 119,4 124,44 128,48 134,40 360,40"/></svg></div>
+  <p>12 questions on membrane and action potentials, answered together with the class.
+     The question appears on the board; you tap your answer here. 15 seconds each,
+     and a faster correct answer is worth more.</p>
   <form id="joinForm" autocomplete="off">
     <label for="name">Your full name</label>
     <input id="name" name="name" type="text" inputmode="text" autocapitalize="words"
            spellcheck="false" maxlength="60" required
            placeholder="e.g. Ada Lovelace" enterkeyhint="go">
     <p class="err" id="joinErr" aria-live="polite"></p>
-    <button class="btn" id="joinBtn" type="submit">Start the quiz</button>
+    <button class="btn" id="joinBtn" type="submit">Join the exam</button>
   </form>
-  <p class="note" style="margin-top:14px">Your name and score are recorded so your lecturer can see the class results.</p>
-  <p style="margin-top:18px;font-size:.9rem;text-align:center"><a href="present.html">Lecturer? Show the QR code for the class</a></p>
+  <p class="note" style="margin-top:14px"><b>One attempt each.</b> Your name and score are
+     recorded so your lecturer can see the class results.</p>
+  <p style="margin-top:18px;font-size:.9rem;text-align:center"><a href="present.html">Lecturer? Open the board</a></p>
 </section>
 
-<!-- 2. the quiz ---------------------------------------------------------- -->
-<section id="quiz" class="hidden">
-  <div class="strip"><svg viewBox="0 0 360 60" role="img" aria-label="Your progress trace"><line class="base" x1="0" y1="40" x2="360" y2="40"/><polyline class="tr" id="tr" points="0,40"/></svg>
-    <div class="meta"><span id="cnt"></span><span id="stk"></span></div></div>
-  <h2 id="q" tabindex="-1"></h2>
-  <div class="opts" id="opts"></div>
-  <div id="fb" class="fb hidden" aria-live="polite"></div>
-  <button class="btn hidden" id="next">Next question</button>
+<!-- 2. joined, waiting for the lecturer ---------------------------------- -->
+<section id="wait" class="hidden">
+  <h1 id="waitTitle">You're in</h1>
+  <p id="waitText">Look up at the board. The exam starts when your lecturer says so.</p>
+  <p class="note" id="who"></p>
 </section>
 
-<!-- 3. result ------------------------------------------------------------ -->
-<section id="end" class="hidden">
-  <div class="strip"><svg viewBox="0 0 360 60" aria-hidden="true"><line class="base" x1="0" y1="40" x2="360" y2="40"/><polyline class="tr" id="tr2" points="0,40"/></svg></div>
-  <div class="big spark" id="sc"></div>
-  <h2 id="ti"></h2>
-  <p id="whoami" class="note"></p>
-  <div class="dots" id="dots" aria-hidden="true"></div>
-  <button class="btn" id="again">Try again (options reshuffle)</button>
-  <p class="note" style="margin-top:12px">Every attempt is saved. Your lecturer sees your best score and how many tries it took.</p>
+<!-- 3. the answer pad ---------------------------------------------------- -->
+<section id="play" class="hidden">
+  <div class="qtop">
+    <span id="pno">Question 1 / 12</span>
+    <span class="secs" id="psecs">15</span>
+  </div>
+  <div class="clock"><i id="pclock"></i></div>
+  <p class="lookup">The question is on the board.</p>
+  <div class="opts" id="popts"></div>
+  <div id="pfb" class="fb hidden" aria-live="polite"></div>
 </section>
 
-<!-- 4. quiz closed by the lecturer --------------------------------------- -->
-<section id="closed" class="hidden">
-  <h1>Not open yet</h1>
-  <p>Your lecturer hasn't opened the quiz. Wait for the go-ahead, then reload this page.</p>
-  <button class="btn" id="retry">Reload</button>
+<!-- 4. your result ------------------------------------------------------- -->
+<section id="fin" class="hidden">
+  <p class="note">Your score</p>
+  <div class="big spark" id="fpts">0</div>
+  <h2 id="ftitle"></h2>
+  <p id="fsub" class="note"></p>
+  <p class="note" style="margin-top:18px">The top three are on the board.</p>
 </section>
 
 </main>
 <div id="sync" class="sync hidden" role="status" aria-live="polite"></div>
-<script type="module" src="app.js?v=2"></script>
+<script type="module" src="app.js?v=3"></script>
 </body>
 </html>

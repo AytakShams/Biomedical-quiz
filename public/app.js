@@ -1,36 +1,42 @@
-// Student quiz. Practice mode: instant feedback, unlimited retries.
+// The student's phone: an answer pad, nothing more. The question is read off the board;
+// this page shows the four options, the clock, and what the last answer cost.
 //
-// Network model, built for flaky lecture-hall Wi-Fi:
-//   * questions + answer key ship with the page, so once loaded the quiz runs OFFLINE;
-//   * every answer goes into a localStorage queue and is flushed in batches;
-//   * a failed flush retries with exponential backoff -- nothing is ever lost;
-//   * the server re-grades from the submitted choice text, so the score it stores is
-//     authoritative. The key being here lets a student peek, not forge a score.
-
-import { QUIZ, QUESTIONS, ANSWER_KEY } from "./questions.js";
+// Deliberately NOT imported here: questions.js. The server sends the four option texts of
+// the live question only, so the page source a student can read contains no question bank
+// and no answer key at all.
+//
+// There is also no offline queue any more. Under a hard 15-second server-side deadline a
+// retry queue would faithfully deliver answers that are already too late to score, which
+// is worse than useless -- it would promise points that never arrive. So an answer is
+// posted immediately and retried only inside its own window.
 
 const $ = s => document.querySelector(s);
-const N = QUESTIONS.length;
+const TKEY = "bq.token", NKEY = "bq.name";
+const LETTERS = ["A", "B", "C", "D"];        // the board labels the options the same way
+const SCREENS = ["join", "wait", "play", "fin"];
+const bust = p => p + (p.includes("?") ? "&" : "?") + "t=" + Date.now();   // beat proxy caches
 
-/* ---------------------------------------------------------------- queue --- */
-const QKEY = "bq.queue", NKEY = "bq.name";
-const api = p => p + (p.includes("?") ? "&" : "?") + "t=" + Date.now(); // beat proxy caches
+let token = localStorage.getItem(TKEY) || "";
+let state = null;
+let clockAnchor = null;      // { at: performance.now(), ms } -- the phone's clock is never used
+let paintedIndex = -1;
+let sending = false;
+let timer = null;
 
-let queue = load();
-let flushing = false, fails = 0, timer = null;
+const show = id => SCREENS.forEach(s => $("#" + s).classList.toggle("hidden", s !== id));
+const ordinal = n => n + (["th", "st", "nd", "rd"][(n % 100 > 10 && n % 100 < 14) ? 0 : Math.min(n % 10, 4)] || "th");
+const num = n => Number(n || 0).toLocaleString("en-US");
 
-function load(){ try { return JSON.parse(localStorage.getItem(QKEY)) || [] } catch { return [] } }
-function save(){ try { localStorage.setItem(QKEY, JSON.stringify(queue)) } catch {} }
-
-function enqueue(item){ queue.push(item); save(); schedule(120) }
-
-function schedule(ms){
-  clearTimeout(timer);
-  timer = setTimeout(flush, ms);
+function status(state_, text) {
+  const el = $("#sync");
+  if (!state_) { el.classList.add("hidden"); return }
+  el.classList.remove("hidden");
+  el.dataset.state = state_;
+  el.textContent = text;
 }
 
-async function post(path, body){
-  const r = await fetch(api(path), {
+async function post(path, body) {
+  const r = await fetch(bust(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     cache: "no-store",
@@ -40,102 +46,7 @@ async function post(path, body){
   return r.json();
 }
 
-// A 4xx means the server has rejected this attempt for good (unknown token, bad body).
-// Retrying can never succeed, so those items are dropped rather than queued forever --
-// otherwise the pill would keep promising a delivery that will never happen.
-const permanent = err => err.status >= 400 && err.status < 500
-                      && err.status !== 408 && err.status !== 429;
-
-// Sends everything pending, attempt by attempt: answers first, then that attempt's
-// finish. One failing attempt never blocks the others.
-async function flush(){
-  if (flushing || !queue.length) return;
-  flushing = true;
-  status("wait", "Saving…");
-  let stalled = false, dropped = false;
-
-  try {
-    for (const token of [...new Set(queue.map(i => i.token))]) {
-      try {
-        const answers = queue.filter(i => i.token === token && !i.fin);
-        if (answers.length) {
-          // The score this returns is a RUNNING total over whatever has arrived so
-          // far, so it is deliberately ignored -- only /api/finish is authoritative.
-          await post("/api/answers", {
-            token,
-            answers: answers.map(({ qId, choice, ms, at }) => ({ qId, choice, ms, at }))
-          });
-          queue = queue.filter(i => !(i.token === token && !i.fin));
-          save();
-        }
-        const fin = queue.find(i => i.token === token && i.fin);
-        if (fin) {
-          const res = await post("/api/finish", { token });
-          if (typeof res.score === "number") { serverScore = res.score; paintScore() }
-          queue = queue.filter(i => i !== fin);
-          save();
-        }
-      } catch (err) {
-        if (permanent(err)) { queue = queue.filter(i => i.token !== token); save(); dropped = true }
-        else stalled = true;
-      }
-    }
-  } finally {
-    flushing = false;
-  }
-
-  if (stalled) {
-    fails++;
-    status("wait", "No connection — your answers are safe on this phone and will be sent automatically.");
-    schedule(Math.min(30000, 1000 * 2 ** fails) + Math.random() * 500);
-  } else if (dropped) {
-    // The server refused this attempt outright, so those answers are gone. Say so
-    // plainly rather than showing "Saved" over data that was discarded.
-    fails = 0;
-    status("wait", "This attempt could not be saved. Please reload the page and start again.");
-  } else {
-    fails = 0;
-    status("ok", "Saved");
-    setTimeout(() => { if (!queue.length) status(null) }, 1600);
-  }
-}
-
-function status(state, text){
-  const el = $("#sync");
-  if (!state) { el.classList.add("hidden"); return }
-  el.classList.remove("hidden");
-  el.dataset.state = state;
-  el.textContent = text;
-}
-
-addEventListener("online", () => { fails = 0; schedule(200) });
-addEventListener("visibilitychange", () => { if (!document.hidden) schedule(200) });
-// Last-ditch delivery if the student closes the tab mid-quiz.
-addEventListener("pagehide", () => {
-  if (!queue.length || !navigator.sendBeacon) return;
-  const token = queue[0].token;
-  const answers = queue.filter(i => i.token === token && !i.fin)
-                       .map(({ qId, choice, ms, at }) => ({ qId, choice, ms, at }));
-  if (!answers.length) return;
-  navigator.sendBeacon("/api/answers",
-    new Blob([JSON.stringify({ token, answers })], { type: "application/json" }));
-});
-
-/* ----------------------------------------------------------------- state --- */
-let token = null, order = [], i = 0, score = 0, streak = 0, res = [], shown = 0;
-let serverScore = null, student = "";
-
-const show = id => ["join", "quiz", "end", "closed"].forEach(s =>
-  $("#" + s).classList.toggle("hidden", s !== id));
-
-const shuffle = a => {
-  a = a.slice();
-  for (let k = a.length - 1; k > 0; k--) { const j = Math.floor(Math.random() * (k + 1)); [a[k], a[j]] = [a[j], a[k]] }
-  return a;
-};
-
 /* ------------------------------------------------------------------ join --- */
-$("#blurb").textContent = QUIZ.blurb + " About 5 minutes.";
 $("#name").value = localStorage.getItem(NKEY) || "";
 
 $("#joinForm").addEventListener("submit", async e => {
@@ -146,131 +57,189 @@ $("#joinForm").addEventListener("submit", async e => {
   const btn = $("#joinBtn");
   btn.disabled = true; btn.textContent = "Joining…"; $("#joinErr").textContent = "";
   try {
-    const r = await post("/api/join", { name, quizId: QUIZ.id, total: N });
-    token = r.token; student = r.name || name;
-    localStorage.setItem(NKEY, student);
-    start();
+    const r = await post("/api/join", { name });
+    // Joining with a name that is already in this session hands back the SAME attempt, so
+    // a reload or a locked phone never costs a student their answers -- and never buys
+    // them a second go either.
+    token = r.token;
+    localStorage.setItem(TKEY, token);
+    localStorage.setItem(NKEY, r.name || name);
+    $("#who").textContent = `Signed in as ${r.name || name}.`;
+    startPolling();
   } catch (err) {
-    $("#joinErr").textContent = String(err.message).includes("409")
-      ? "The quiz isn't open yet. Ask your lecturer to start it."
+    $("#joinErr").textContent = err.status === 409
+      ? "The exam is not open for new students. Ask your lecturer."
+      : err.status === 429
+      ? "This session is full."
       : "Couldn't reach the server. Check the Wi-Fi and try again.";
   } finally {
-    btn.disabled = false; btn.textContent = "Start the quiz";
+    btn.disabled = false; btn.textContent = "Join the exam";
   }
 });
 
-$("#retry").addEventListener("click", () => location.reload());
+/* ---------------------------------------------------------------- answer --- */
+async function answer(k) {
+  if (sending || !state || state.phase !== "question" || state.answered) return;
+  sending = true;
+  state.answered = true; state.myChoice = k;   // lock the buttons on this tap, not on the reply
+  renderPlay();
 
-/* ------------------------------------------------------------------ quiz --- */
-function start(){
-  order = shuffle(QUESTIONS.map((_, k) => k));
-  i = 0; score = 0; streak = 0; res = []; serverScore = null;
-  show("quiz"); render();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await post("/api/answer", { token, qIndex: state.qIndex, choice: k });
+      state.myChoice = r.choice;               // the first answer stands; believe the server
+      status(null);
+      sending = false;
+      return;
+    } catch (err) {
+      if (err.status === 409) {                // the window closed while this was in flight
+        status("wait", "That question had already closed.");
+        sending = false;
+        return;
+      }
+      if (attempt === 2) {
+        status("wait", "That answer didn't send. Check the Wi-Fi.");
+        state.answered = false;                // let them try again inside what is left
+        sending = false;
+        renderPlay();
+        return;
+      }
+      await new Promise(done => setTimeout(done, 400));
+    }
+  }
 }
 
-// Builds the action-potential trace: a spike per correct answer, a dip per miss.
-function pts(){
-  const w = 360 / N, p = ["0,40"];
-  res.forEach((r, k) => {
-    const x = k * w;
-    p.push(r ? `${x + w * .2},40 ${x + w * .3},4 ${x + w * .45},44 ${x + w * .6},48 ${x + w * .8},40`
-             : `${x + w * .3},46 ${x + w * .6},50 ${x + w * .85},40`);
-  });
-  p.push(360 * res.length / N + ",40");
-  return p.join(" ");
-}
-
-function render(){
-  const item = QUESTIONS[order[i]];
-  $("#q").textContent = item.q;
-  $("#cnt").textContent = `Question ${i + 1} of ${N}`;
-  $("#stk").textContent = streak > 1 ? `Streak ×${streak}` : "";
-  $("#tr").setAttribute("points", pts());
-
-  const box = $("#opts");
-  box.innerHTML = "";
-  shuffle([[item.correct, 1], ...item.wrong.map(t => [t, 0])]).forEach(([text, ok]) => {
-    const b = document.createElement("button");
-    // dataset stringifies whatever it is given; say "1"/"0" outright so the read
-    // side below compares against exactly what was written.
-    b.className = "opt"; b.type = "button"; b.textContent = text; b.dataset.ok = ok ? "1" : "0";
-    b.onclick = () => pick(b, !!ok, text);
-    box.appendChild(b);
-  });
-
-  $("#fb").classList.add("hidden");
-  $("#next").classList.add("hidden");
-  $("#q").focus({ preventScroll: true });
-  shown = Date.now();
-}
-
-function pick(btn, ok, choice){
-  const item = QUESTIONS[order[i]];
-
-  document.querySelectorAll(".opt").forEach(x => {
-    x.disabled = true;
-    if (x.dataset.ok === "1") x.classList.add("ok");
-    else if (x !== btn) x.classList.add("dim");
-  });
-  if (!ok) btn.classList.add("bad");
-
-  res.push(ok);
-  ok ? (score++, streak++) : streak = 0;
-  $("#tr").setAttribute("points", pts());
-  $("#stk").textContent = streak > 1 ? `Streak ×${streak}` : "";
-
-  const f = $("#fb");
-  f.className = "fb " + (ok ? "ok" : "bad");
-  f.innerHTML = `<b></b><span></span>`;
-  f.firstChild.textContent = ok ? "Spike! Threshold reached." : "Subthreshold. Not this time.";
-  f.lastChild.textContent = item.why;
-
-  enqueue({ token, qId: item.id, choice, ms: Date.now() - shown, at: Date.now() });
-
-  const n = $("#next");
-  n.textContent = i === N - 1 ? "See my result" : "Next question";
-  n.classList.remove("hidden");
-  n.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
-}
-
-$("#next").addEventListener("click", () => { i++; i < N ? render() : done() });
-$("#again").addEventListener("click", async () => {
-  // A retry is a brand-new attempt: ask the server for a fresh token so both
-  // attempts are kept and the lecturer sees the try count.
-  const btn = $("#again");
-  btn.disabled = true; btn.textContent = "Starting…";
+/* ------------------------------------------------------------------ poll --- */
+async function poll() {
+  if (!token) return;
   try {
-    const r = await post("/api/join", { name: student, quizId: QUIZ.id, total: N });
-    token = r.token;
-    start();
+    const r = await fetch(bust("/api/state?token=" + encodeURIComponent(token)), { cache: "no-store" });
+    if (r.status === 404) {                    // the session was replaced: start clean
+      localStorage.removeItem(TKEY);
+      token = "";
+      show("join");
+      $("#joinErr").textContent = "That exam has been reset. Join again.";
+      return;
+    }
+    if (!r.ok) return;
+    // A tap being sent right now owns `answered`; a poll landing mid-flight must not
+    // overwrite it with the server's not-yet-updated view.
+    const fresh = await r.json();
+    if (sending && state) { fresh.answered = state.answered; fresh.myChoice = state.myChoice }
+    state = fresh;
+    render();
   } catch {
-    status("wait", "Can't start a new attempt while offline. Try again in a moment.");
-  } finally {
-    btn.disabled = false; btn.textContent = "Try again (options reshuffle)";
+    status("wait", "Reconnecting…");
   }
-});
-
-function done(){
-  show("end");
-  $("#tr2").setAttribute("points", pts());
-  $("#dots").innerHTML = res.map(r => `<i class="${r ? "o" : ""}"></i>`).join("");
-  $("#whoami").textContent = `Recorded as ${student}.`;
-  paintScore();
-  enqueue({ token, fin: true });
 }
 
-function paintScore(){
-  const s = serverScore ?? score;
-  $("#sc").textContent = `${s} / ${N}`;
-  $("#ti").textContent =
-    s === N ? "Full-size spike. All-or-none, and you went all."
-    : s >= 9 ? "Suprathreshold. Nicely done."
-    : s >= 6 ? "Hovering near threshold. One more stimulus."
-    : "Subthreshold. Review the explanations and try again.";
+function startPolling() {
+  clearTimeout(timer);
+  (async function loop() {
+    await poll();
+    const live = state && (state.phase === "question" || state.phase === "reveal");
+    timer = setTimeout(loop, live ? 1000 : 2000);
+  })();
 }
 
-// Defensive: the key must cover every question, or grading would silently skip one.
-if (ANSWER_KEY.size !== N) console.warn("questions.js: answer key does not cover every question");
+addEventListener("visibilitychange", () => { if (!document.hidden && token) startPolling() });
+addEventListener("online", () => { if (token) startPolling() });
 
-// Flush anything left over from a previous visit (tab closed mid-quiz, Wi-Fi died).
-if (queue.length) schedule(400);
+/* ---------------------------------------------------------------- render --- */
+function render() {
+  if (!state) return;
+  if (state.phase === "lobby") {
+    show("wait");
+    $("#waitTitle").textContent = "You're in";
+    $("#waitText").textContent = "Look up at the board. The exam starts when your lecturer says so.";
+    if (!$("#who").textContent) $("#who").textContent = `Signed in as ${localStorage.getItem(NKEY) || "you"}.`;
+  } else if (state.phase === "question" || state.phase === "reveal") {
+    show("play");
+    renderPlay();
+  } else if (state.phase === "done") {
+    show("fin");
+    renderDone();
+  }
+}
+
+function renderPlay() {
+  const s = state;
+  const revealing = s.phase === "reveal";
+
+  if (s.qIndex !== paintedIndex) {
+    const box = $("#popts");
+    box.innerHTML = "";
+    (s.options || []).forEach((text, k) => {
+      const b = document.createElement("button");
+      b.className = "opt pad o" + k;
+      b.type = "button";
+      b.innerHTML = "<b></b><span></span>";
+      b.firstChild.textContent = LETTERS[k];
+      b.lastChild.textContent = text;
+      b.onclick = () => answer(k);
+      box.appendChild(b);
+    });
+    paintedIndex = s.qIndex;
+  }
+
+  $("#pno").textContent = `Question ${s.questionNo} / ${s.total}`;
+  document.querySelectorAll("#popts .opt").forEach((b, k) => {
+    b.disabled = revealing || !!s.answered;
+    b.classList.toggle("mine", s.myChoice === k);
+    b.classList.toggle("ok",   revealing && k === s.correctIndex);
+    b.classList.toggle("bad",  revealing && s.myChoice === k && k !== s.correctIndex);
+    b.classList.toggle("dim",  revealing && k !== s.correctIndex && s.myChoice !== k);
+  });
+
+  const fb = $("#pfb");
+  if (revealing) {
+    fb.className = "fb " + (s.wasCorrect ? "ok" : "bad");
+    fb.innerHTML = "<b></b><span></span>";
+    fb.firstChild.textContent = s.wasCorrect
+      ? `Spike! +${num(s.earned)} points`
+      : s.answered ? "Subthreshold. No points." : "No answer, no points.";
+    fb.lastChild.textContent = `${num(s.myPoints)} points · ${s.myCorrect} correct`
+      + (s.myRank ? ` · ${ordinal(s.myRank)} of ${s.ranked}` : "");
+  } else if (s.answered) {
+    fb.className = "fb";
+    fb.innerHTML = "<b></b><span></span>";
+    fb.firstChild.textContent = "Locked in.";
+    fb.lastChild.textContent = "Look at the board for the answer.";
+  } else {
+    fb.className = "fb hidden";
+  }
+
+  clockAnchor = s.phase === "question" ? { at: performance.now(), ms: s.remainingMs } : null;
+}
+
+function renderDone() {
+  const s = state;
+  $("#fpts").textContent = num(s.myPoints);
+  $("#ftitle").textContent =
+      s.myRank === 1 ? "You topped the class."
+    : s.myRank <= 3  ? `${ordinal(s.myRank)} place. You're on the board.`
+    : s.myCorrect === s.total ? "Every question right."
+    : s.myCorrect >= s.total * .75 ? "Suprathreshold. Nicely done."
+    : s.myCorrect >= s.total / 2 ? "Hovering near threshold."
+    : "Subthreshold this time.";
+  $("#fsub").textContent = `${s.myCorrect} of ${s.total} correct`
+    + (s.myRank ? ` · ${ordinal(s.myRank)} of ${s.ranked} students` : "");
+}
+
+// Same trick as the board: the server sends a remaining duration, never a timestamp, so a
+// phone with a wrong clock still counts down correctly, and every poll re-anchors it.
+setInterval(() => {
+  if (!clockAnchor) {
+    if (state && state.phase === "reveal") { $("#psecs").textContent = "0"; $("#pclock").style.width = "0%" }
+    return;
+  }
+  const span = Math.max(1, state?.questionMs || 15000);
+  const left = Math.max(0, clockAnchor.ms - (performance.now() - clockAnchor.at));
+  $("#psecs").textContent = Math.ceil(left / 1000);
+  $("#psecs").classList.toggle("urgent", left <= 5000);
+  $("#pclock").style.width = (left / span * 100) + "%";
+}, 100);
+
+// Reloaded, or came back to a tab from earlier in the lecture? The token is enough to
+// drop straight back into whatever the class is doing now.
+if (token) { show("wait"); startPolling() }
