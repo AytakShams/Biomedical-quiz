@@ -98,7 +98,7 @@ separates students who are otherwise level.** Ties go to the lower total answer 
    | `ADMIN_PASSWORD` | a strong password — this is the only lock on the board and the panel |
    | `DB_PATH` | `/data/quiz.db` |
    | `PORT` | `3000` |
-   | `QUESTION_MS` | *optional*, the per-question window in milliseconds (default `15000`) |
+   | `QUESTION_MS` | *optional*, the per-question window in milliseconds (default `25000`) |
 
 4. **Ports Exposes → `3000`**, so Traefik proxies to the right port.
 

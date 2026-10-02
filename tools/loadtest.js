@@ -45,7 +45,7 @@ if (probe.status === 401) {
 // A fresh session, so the test never lands in the middle of a half-played lecture.
 await post("/api/admin/session", { action: "create", label: "Load test" }, ADMIN);
 
-const window_ = (await get("/api/board")).json.questionMs || 15000;
+const window_ = (await get("/api/board")).json.questionMs || 25000;
 console.log(`\n${COUNT} students · ${TOTAL} questions · ${window_ / 1000}s per question`);
 console.log(`expect this to take about ${Math.ceil(TOTAL * (window_ + 900) / 1000)}s\n`);
 

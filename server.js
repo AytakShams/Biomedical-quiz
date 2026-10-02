@@ -41,7 +41,7 @@ const MAX_STUDENTS_PER_SESSION = 500;   // soft guard; a real class is ~80
 // The window every student gets, per question. Overridable so the load test can run a
 // twelve-question exam in seconds -- and so the lecturer can retune the pace without a
 // code change. The board and every phone read it from the server, never hard-code it.
-const QUESTION_MS = Math.max(1000, Number(process.env.QUESTION_MS || 15000));
+const QUESTION_MS = Math.max(1000, Number(process.env.QUESTION_MS || 25000));
 const GRACE_MS    = 1200;    // an answer already in flight when the clock hit 0 still counts
 const BASE_POINTS = 1000;    // knowing the answer is worth this much whenever it lands
 const SPEED_POINTS = 200;    // ...plus at most this much for being early

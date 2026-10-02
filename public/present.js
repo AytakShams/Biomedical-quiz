@@ -185,7 +185,7 @@ function paintQuestion() {
 // wrong clock still counts down correctly. Each poll re-anchors it, so the local run can
 // never drift away from the server's deadline.
 setInterval(() => {
-  const span = Math.max(1, data?.questionMs || 15000);
+  const span = Math.max(1, data?.questionMs || 25000);
   if (!clockAnchor) {
     $("#clockbar").style.width = shownPhase === "reveal" ? "0%" : "100%";
     if (shownPhase === "reveal") $("#secs").textContent = "0";

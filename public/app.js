@@ -233,7 +233,7 @@ setInterval(() => {
     if (state && state.phase === "reveal") { $("#psecs").textContent = "0"; $("#pclock").style.width = "0%" }
     return;
   }
-  const span = Math.max(1, state?.questionMs || 15000);
+  const span = Math.max(1, state?.questionMs || 25000);
   const left = Math.max(0, clockAnchor.ms - (performance.now() - clockAnchor.at));
   $("#psecs").textContent = Math.ceil(left / 1000);
   $("#psecs").classList.toggle("urgent", left <= 5000);
