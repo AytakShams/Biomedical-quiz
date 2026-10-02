@@ -5,6 +5,7 @@ FROM node:24-alpine
 ENV NODE_ENV=production \
     PORT=3000 \
     DB_PATH=/data/quiz.db
+    QUESTION_MS=2500
 
 WORKDIR /app
 COPY package.json server.js ./
